@@ -2239,7 +2239,7 @@ get_dahlin_source() {
 
 	# Download the dahdi-linux-extra repo. This is needed for OSLEC support.
 	if [ ! -d dahdi-linux-extra.git ]; then
-		git clone --single-branch http://git.tzafrir.org.il/cgit/dahdi-extra.git/
+		git clone --single-branch https://git.sr.ht/~tzafrir/dahdi-extra
 		if [ $? -ne 0 ]; then
 			die "Failed to clone dahdi-extra repo"
 		fi
