@@ -31,6 +31,7 @@
 
 #include <pthread.h>
 #include <signal.h>
+#include <sys/wait.h>
 
 #include "asterisk/file.h"
 #include "asterisk/pbx.h"
@@ -42,6 +43,7 @@
 #include "asterisk/stasis_channels.h"
 #include "asterisk/devicestate.h"
 #include "asterisk/conversions.h"
+#include "asterisk/app.h" /* use ast_close_fds_above_n */
 
 /*** DOCUMENTATION
 	<configInfo name="res_smdr_whozz" language="en_US">
@@ -135,8 +137,11 @@ enum line_state {
 
 struct whozz_line {
 	int lineno;							/*!< Line number on WHOZZ Calling? system */
+	int dahdichan;						/*!< DAHDI channel number */
 	struct ast_channel *chan;			/*!< Dummy channel for CDR */
 	const char *device;					/*!< Asterisk device */
+	const char *record_context;			/*!< Recording dialplan context */
+	pid_t recordpid;					/*!< Recording process ID */
 	unsigned int detect_dialing:1;		/*!< Whether to detect dialing in Asterisk, instead of relying on the WHOZZ Calling hardware */
 	enum line_state state;				/*!< Current line state */
 	enum ast_device_state startstate;	/*!< Starting device state of associated FXO device, if applicable */
@@ -598,6 +603,71 @@ static int handle_hook(struct whozz_line *w, int outbound, int end, int duration
 	return 0;
 }
 
+static int record_stop(struct whozz_line *w)
+{
+	if (w->recordpid > 0) {
+		int res, status;
+		if (kill(w->recordpid, SIGINT)) {
+			if (errno == ESRCH) {
+				w->recordpid = 0;
+			}
+			ast_log(LOG_ERROR, "Failed to send signal to %d: %s\n", w->recordpid, strerror(errno));
+			return -1;
+		}
+		res = waitpid(w->recordpid, &status, 0);
+		if (res > -1) {
+			res = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+			if (WIFEXITED(status)) {
+				w->recordpid = 0;
+				ast_verb(5, "Stopped recording line %d\n", w->lineno);
+			}
+		}
+	}
+	return 0;
+}
+
+static int record_start(struct whozz_line *w, const char *exten)
+{
+	char tmpbuf[512], filename[1024];
+	char dahdichanstr[32];
+	struct ast_channel *dummy;
+
+	snprintf(dahdichanstr, sizeof(dahdichanstr), "%d", w->dahdichan);
+
+	dummy = ast_dummy_channel_alloc();
+	if (!dummy) {
+		ast_log(LOG_ERROR, "Failed to allocate dummy channel\n");
+		return -1;
+	}
+
+	/* Same as EVAL_EXTEN: */
+	if (ast_get_extension_data(tmpbuf, sizeof(tmpbuf), dummy, w->record_context, exten, 1)) {
+		ast_debug(1, "No extension '%s' found in context %s\n", exten, w->record_context);
+		ast_channel_release(dummy);
+		return 0;
+	}
+	pbx_substitute_variables_helper_full_location(dummy, ast_channel_varshead(dummy), tmpbuf, filename, sizeof(filename), NULL, w->record_context, exten, 1);
+	ast_channel_release(dummy);
+
+	/* Start recording in the background async */
+	w->recordpid = ast_safe_fork(0);
+	if (w->recordpid == -1) {
+		ast_log(LOG_ERROR, "fork failed: %s\n", strerror(errno));
+		w->recordpid = 0;
+		return -1;
+	}
+	if (w->recordpid == 0) {
+		ast_close_fds_above_n(STDERR_FILENO);
+		ast_set_priority(0);
+		execl("/usr/sbin/dahdi_monitor", "dahdi_monitor", dahdichanstr, "-r", filename, (char*) NULL);
+		ast_log(LOG_ERROR, "Failed to start dahdi_monitor: %s\n", strerror(errno));
+		_exit(1);
+	}
+
+	ast_verb(5, "Started recording line %d to %s (pid %d)\n", w->lineno, filename, w->recordpid);
+	return 0;
+}
+
 #define EXPECT_NONEMPTY(s) \
 	if (ast_strlen_zero(s)) { \
 		ast_log(LOG_WARNING, "Expected %s to be non-empty\n", #s); \
@@ -753,8 +823,22 @@ static int __process_serial_read(struct whozz_line *w, int lineno, const char *a
 		} else {
 			ast_log(LOG_NOTICE, "%s call %s on line %d to %s\n", outbound ? "Outbound" : "Inbound", "began", lineno, numberstr);
 		}
+
 		/* Log/store the appropriate details */
 		handle_hook(w, outbound, callend, duration, numberstr, cnam);
+
+		/* Start/stop call recording */
+		if (w->record_context && outbound) {
+			if (callend) {
+				record_stop(w);
+			} else {
+				/* This is intentionally after handle_hook, since that sets w->startstate */
+				if (w->startstate != AST_DEVICE_INUSE) {
+					record_start(w, numberstr);
+				}
+			}
+		}
+
 		if (callend) {
 			if (outbound) {
 				manager_event(EVENT_FLAG_CALL, "WHOZZLineCall",
@@ -1058,7 +1142,8 @@ static int load_config(void)
 			}
 		} else { /* it's a line definition */
 			struct whozz_line *w;
-			const char *device = NULL;
+			const char *device = NULL, *recordcontext = NULL;
+			char *data;
 			for (var = ast_variable_browse(cfg, cat); var; var = var->next) {
 				if (!strcasecmp(var->name, "line")) {
 					if (ast_str_to_int(var->value, &tmp)) {
@@ -1072,6 +1157,8 @@ static int load_config(void)
 						ast_log(LOG_WARNING, "Setting 'device' must be a DAHDI device\n");
 						device = NULL;
 					}
+				} else if (!strcasecmp(var->name, "record_context")) {
+					recordcontext = var->value;
 				} else if (!strcasecmp(var->name, "setvar")) {
 					continue; /* Ignore on this pass */
 				} else {
@@ -1084,15 +1171,33 @@ static int load_config(void)
 					return -1;
 				}
 			}
-			w = ast_calloc(1, sizeof(*w) + (device ? strlen(device) + 1 : 0));
+			w = ast_calloc(1, sizeof(*w) + (device ? strlen(device) + 1 : 0) + (recordcontext ? strlen(recordcontext) + 1 : 0));
 			if (!w) {
 				ast_config_destroy(cfg);
 				return -1;
 			}
 			w->lineno = tmp;
+			data = w->data;
 			if (!ast_strlen_zero(device)) {
-				strcpy(w->data, device); /* Safe */
-				w->device = w->data;
+				const char *slash;
+				strcpy(data, device); /* Safe */
+				w->device = data;
+				data += strlen(device) + 1;
+				slash = strchr(w->device, '/');
+				ast_assert(slash != NULL);
+				w->dahdichan = atoi(slash + 1);
+			}
+			if (!ast_strlen_zero(recordcontext)) {
+				if (!device) {
+					ast_log(LOG_ERROR, "record_context requires device to be specified\n");
+					recordcontext = NULL;
+				} else if (strncasecmp(device, "DAHDI/", 6)) {
+					ast_log(LOG_WARNING, "record_context can only be used with DAHDI devices\n");
+					recordcontext = NULL;
+				} else {
+					strcpy(data, recordcontext);
+					w->record_context = data;
+				}
 			}
 			/* Now, add any variables */
 			for (var = ast_variable_browse(cfg, cat); var; var = var->next) {
@@ -1148,6 +1253,10 @@ static int unload_module(void)
 	AST_RWLIST_WRLOCK(&lines);
 	while ((w = AST_RWLIST_REMOVE_HEAD(&lines, entry))) {
 		struct ast_var_t *var;
+
+		/* Stop any pending recordings */
+		record_stop(w);
+
 		if (w->chan) {
 			cleanup_stale_cdr(w->chan);
 			w->chan = NULL;
