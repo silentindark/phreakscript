@@ -351,8 +351,8 @@ static int waitframe_exec(struct ast_channel *chan, const char *data)
 				pbx_builtin_setvar_helper(chan, "WAITFORFRAMESTATUS", "HANGUP");
 				res = -1;
 				break;
-			} else if (frame->frametype == waitframe && (frame->frametype != AST_FRAME_CONTROL ||
-				subtype == frame->subclass.integer)) {
+			} else if (frame->frametype == waitframe && (frame->frametype != AST_FRAME_CONTROL || subtype == frame->subclass.integer)) {
+				ast_frfree(frame);
 				if (++hits >= reqmatches) {
 					pbx_builtin_setvar_helper(chan, "WAITFORFRAMESTATUS", "SUCCESS");
 					break;
@@ -360,6 +360,7 @@ static int waitframe_exec(struct ast_channel *chan, const char *data)
 			} else if (frame->frametype == AST_FRAME_DTMF_END) {
 				char exten[2];
 				char digit = frame->subclass.integer;
+				ast_frfree(frame);
 				*exten = digit;
 				*(exten + 1) = '\0';
 				if (ast_exists_extension(chan, ast_channel_context(chan), exten, 1, NULL)) {
@@ -367,6 +368,8 @@ static int waitframe_exec(struct ast_channel *chan, const char *data)
 					ast_explicit_goto(chan, NULL, exten, 1);
 					break;
 				}
+			} else {
+				ast_frfree(frame);
 			}
 			if (audiofile && ast_channel_streamid(chan) == -1 && ast_channel_timingfunc(chan) == NULL) {
 				/* Stream ended, start it again */
